@@ -55,6 +55,17 @@ const KIND_BY_TOPIC: Record<string, GuardEventKind> = {
 /** Where an event was observed. A blocked decision can only be `diagnostic`. */
 export type GuardEventSource = "ledger" | "diagnostic";
 
+/**
+ * The stream discriminator on a `GuardEvent` (issue #67).
+ *
+ * `source` records the observation channel (`ledger` vs `diagnostic`); this
+ * field states the same fact in the vocabulary a consumer of the **unified**
+ * stream reads, so one `for await (const event of listener.watchAll())` loop can
+ * tell a committed event from a pre-broadcast one without knowing the SDK's
+ * two-channel model.
+ */
+export type GuardEventStream = "committed" | "diagnostic";
+
 export interface GuardEvent {
   /**
    * Stable identity for this event, non-null on both streams.
@@ -68,11 +79,25 @@ export interface GuardEvent {
   /** The event's name topic, e.g. `event_auth_checked`. */
   topic: string;
   source: GuardEventSource;
+  /**
+   * Which of the listener's two streams produced this event, derived from
+   * `source`: `ledger` → `committed`, `diagnostic` → `diagnostic`. Present on
+   * every `GuardEvent` the SDK emits, including from `watch()`. Additive
+   * (issue #67).
+   */
+  stream: GuardEventStream;
   /** The contract that emitted it, when the stream identifies one. */
   contractId: string | null;
   /** Ledger sequence, when the event was committed. */
   ledger: number | null;
   ledgerClosedAt: string | null;
+  /**
+   * When a diagnostic event was observed, ISO-8601. `null` on the committed
+   * stream (which carries `ledgerClosedAt` instead) and on diagnostics read
+   * straight off `diagnosticsToEvents`; `watchAll()` stamps it at the moment
+   * the batch is merged in. Additive (issue #67).
+   */
+  observedAt: string | null;
   transactionHash: string | null;
   /** Present only for `auth_checked`. */
   decision: GuardAuthDecision | null;
@@ -198,9 +223,17 @@ function stableStringify(value: unknown, depth = 0): string {
  * The stream facts known at decode time, before the event's `id` is derived
  * from them.
  */
-export type GuardEventContext = Omit<GuardEvent, "kind" | "topic" | "id" | "decision" | "data"> & {
+export type GuardEventContext = Omit<
+  GuardEvent,
+  "kind" | "topic" | "id" | "decision" | "data" | "stream" | "observedAt"
+> & {
   /** Position within the diagnostic batch; null on the ledger stream. */
   simulationIndex: number | null;
+  /**
+   * Observation time for a diagnostic event; omitted (→ `null`) on the
+   * committed stream, which anchors on `ledgerClosedAt` instead.
+   */
+  observedAt?: string | null;
 };
 
 /** Interpret an already-decoded topic list plus data as a `GuardEvent`. */
@@ -211,7 +244,7 @@ function interpret(
 ): GuardEvent | null {
   const topic = topics[0];
   if (!topic || !KNOWN_TOPICS.has(topic)) return null;
-  const { simulationIndex, ...streamFacts } = context;
+  const { simulationIndex, observedAt, ...streamFacts } = context;
   return {
     kind: KIND_BY_TOPIC[topic] ?? "unknown",
     topic,
@@ -225,6 +258,8 @@ function interpret(
       simulationIndex,
     }),
     ...streamFacts,
+    stream: streamFacts.source === "ledger" ? "committed" : "diagnostic",
+    observedAt: observedAt ?? null,
     decision: decodeAuthDecision(topics, context.source),
     data,
   };
@@ -483,6 +518,155 @@ export interface GuardTelemetryWatchParams {
   onGap?: (gap: GuardTelemetryGap) => void;
 }
 
+/**
+ * A batch of already-decoded diagnostic events, with the time they were
+ * observed. This is the second source the unified stream (`watchAll()`) merges
+ * with the committed ledger feed — see `docs/event-schema.md`.
+ */
+export interface GuardDiagnosticBatch {
+  /** Decoded guard events, in the order they were observed. */
+  events: readonly GuardEvent[];
+  /**
+   * ISO-8601 time the batch was observed. Defaults to `new Date().toISOString()`
+   * when omitted, so a merged diagnostic always carries an `observedAt`.
+   */
+  observedAt?: string;
+}
+
+/**
+ * `watchAll()` parameters: the committed-stream options plus the diagnostic
+ * source to interleave with them.
+ */
+export interface GuardTelemetryUnifiedParams extends GuardTelemetryWatchParams {
+  /**
+   * The diagnostic half of the unified stream: batches of decoded events from
+   * `guardEventsFromDiagnostics()` / `telemetryFromDecision()`, in observation
+   * order. Absent → `watchAll()` degenerates cleanly to the committed stream.
+   */
+  diagnostics?: AsyncIterable<GuardDiagnosticBatch> | Iterable<GuardDiagnosticBatch>;
+}
+
+/** Committed events sort by ledger ascending; a missing ledger sorts last. */
+function compareEventsByLedger(a: GuardEvent, b: GuardEvent): number {
+  return (a.ledger ?? Number.MAX_SAFE_INTEGER) - (b.ledger ?? Number.MAX_SAFE_INTEGER);
+}
+
+/** Adapt a sync or async iterable to an async iterator, so both arms can be armed. */
+function asAsyncIterator<T>(source: AsyncIterable<T> | Iterable<T>): AsyncIterator<T> {
+  const asyncSource = source as AsyncIterable<T>;
+  if (typeof asyncSource[Symbol.asyncIterator] === "function") {
+    return asyncSource[Symbol.asyncIterator]();
+  }
+  const syncIterator = (source as Iterable<T>)[Symbol.iterator]();
+  return {
+    next: () => Promise.resolve(syncIterator.next()),
+    return: (value?: unknown) =>
+      Promise.resolve(
+        syncIterator.return ? syncIterator.return(value) : { value: value as T, done: true },
+      ),
+  };
+}
+
+/** One settled arm of the merge: a committed page, a diagnostic batch, or abort. */
+type MergePull =
+  | { source: "committed"; result: IteratorResult<GuardEvent[]> }
+  | { source: "diagnostic"; result: IteratorResult<GuardDiagnosticBatch> }
+  | { source: "abort" };
+
+/**
+ * Merge the committed and diagnostic streams into one ordered, de-duplicated
+ * stream of `GuardEvent`s (issue #67).
+ *
+ * ## Ordering rule
+ *
+ * - **Committed events are emitted in ledger order.** Each page is sorted by
+ *   `ledger` ascending before it is yielded, and pages arrive in cursor order,
+ *   so no committed event overtakes an earlier-ledger one.
+ * - **Diagnostic events are emitted when the batch carrying them is observed**,
+ *   tagged with `observedAt`. A refusal was rolled back before broadcast, so it
+ *   has no ledger to sort on; its position is the point of observation relative
+ *   to the committed frontier already drained, not a ledger. That is the rule a
+ *   consumer relies on: a decision observed at time T appears after the
+ *   committed events drained at or before T.
+ *
+ * ## De-duplication rule
+ *
+ * `GuardEvent.id` is the SDK's delivery key, and the merge emits each id **at
+ * most once** — first observation wins. A guard decision is single-homed (a
+ * blocked decision is rolled back and never committed; an allowed decision has
+ * no diagnostic), so the same decision cannot arrive under two ids. The
+ * duplicate the merge actually guards against is the *same id* delivered twice
+ * — a re-fed diagnostic batch, or an overlapping committed page — which the
+ * emitted-id set suppresses.
+ */
+export async function* mergeGuardEventStreams(
+  committedSource: AsyncIterable<GuardEvent[]> | Iterable<GuardEvent[]>,
+  diagnosticSource?: AsyncIterable<GuardDiagnosticBatch> | Iterable<GuardDiagnosticBatch>,
+  signal?: AbortSignal,
+): AsyncGenerator<GuardEvent, void, undefined> {
+  const committed = asAsyncIterator(committedSource);
+  const diagnostics = diagnosticSource ? asAsyncIterator(diagnosticSource) : null;
+  const emitted = new Set<string>();
+
+  let onAbort: (() => void) | null = null;
+  const abortArm = signal
+    ? new Promise<MergePull>((resolve) => {
+        onAbort = () => resolve({ source: "abort" });
+        if (signal.aborted) onAbort();
+        else signal.addEventListener("abort", onAbort);
+      })
+    : null;
+
+  let committedPull: Promise<MergePull> | null = committed
+    .next()
+    .then((result) => ({ source: "committed" as const, result }));
+  let diagnosticPull: Promise<MergePull> | null = diagnostics
+    ? diagnostics.next().then((result) => ({ source: "diagnostic" as const, result }))
+    : null;
+
+  try {
+    while (committedPull !== null || diagnosticPull !== null) {
+      const pending = [committedPull, diagnosticPull].filter(
+        (pull): pull is Promise<MergePull> => pull !== null,
+      );
+      if (abortArm) pending.push(abortArm);
+      const settled = await (pending.length === 1 ? pending[0]! : Promise.race(pending));
+
+      if (settled.source === "abort") return;
+
+      if (settled.source === "committed") {
+        committedPull = null;
+        if (settled.result.done) continue;
+        for (const event of [...settled.result.value].sort(compareEventsByLedger)) {
+          if (emitted.has(event.id)) continue;
+          emitted.add(event.id);
+          yield event;
+        }
+        committedPull = committed
+          .next()
+          .then((result) => ({ source: "committed" as const, result }));
+      } else {
+        diagnosticPull = null;
+        if (settled.result.done) continue;
+        const observedAt = settled.result.value.observedAt ?? new Date().toISOString();
+        for (const event of settled.result.value.events) {
+          const tagged: GuardEvent = { ...event, stream: "diagnostic", observedAt };
+          if (emitted.has(tagged.id)) continue;
+          emitted.add(tagged.id);
+          yield tagged;
+        }
+        diagnosticPull = diagnostics!
+          .next()
+          .then((result) => ({ source: "diagnostic" as const, result }));
+      }
+    }
+  } finally {
+    if (signal && onAbort) signal.removeEventListener("abort", onAbort);
+    await committed.return?.();
+    if (diagnostics) await diagnostics.return?.();
+  }
+}
+
 export class GuardTelemetryListener {
   private readonly config: GuardTelemetryConfig;
 
@@ -669,6 +853,30 @@ export class GuardTelemetryListener {
       // whole poll delay (5s by default, jittered) before the iterator ends.
       await raceAbort(signal, () => sleep(delay, signal));
     }
+  }
+
+  /**
+   * Follow **both** of the listener's streams as one ordered stream of
+   * `GuardEvent`s (issue #67).
+   *
+   * `watch()` tails committed ledger events only, so a consumer that reads just
+   * it watches a guard that never blocks — a refusal is rolled back before
+   * broadcast and exists only as a simulation diagnostic. `watchAll()` merges
+   * the committed stream with the `diagnostics` the caller feeds in, tags every
+   * event with `stream` (`committed` | `diagnostic`) and `observedAt`, and
+   * de-duplicates by `id`. The ordering and de-duplication rules are documented
+   * on `mergeGuardEventStreams()` and in `docs/event-schema.md`.
+   *
+   * `watch()` is untouched: this is additive, and the default path still yields
+   * committed events only. `signal` ends this stream too (it is forwarded to
+   * both `watch()` and the merge, so a pending diagnostic source cannot hold it
+   * open past teardown).
+   */
+  async *watchAll(
+    params: GuardTelemetryUnifiedParams = {},
+  ): AsyncGenerator<GuardEvent, void, undefined> {
+    if (params.signal?.aborted) return;
+    yield* mergeGuardEventStreams(this.watch(params), params.diagnostics, params.signal);
   }
 }
 

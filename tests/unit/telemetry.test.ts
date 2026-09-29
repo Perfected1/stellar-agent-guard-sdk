@@ -18,7 +18,9 @@ import {
   guardEventId,
   guardEventsFromDiagnostics,
   isAllowedDecision,
+  mergeGuardEventStreams,
   telemetryFromDecision,
+  type GuardDiagnosticBatch,
   type GuardEvent,
   type GuardTelemetryGap,
 } from "../../src/telemetry.ts";
@@ -172,6 +174,19 @@ describe("diagnosticsToEvents & decode equivalence", () => {
     assert.equal(fromDiagnostics.length, 1);
     assert.equal(fromDiagnostics[0]!.decision?.reason, "per_tx_cap_exceeded");
   });
+
+  it("tags decoded diagnostic events with stream=diagnostic and a null observedAt", () => {
+    // The `stream` discriminator is additive (issue #67): present on every
+    // decoded event, derived from `source`, and `observedAt` is left null so
+    // only the unified stream stamps a real observation time.
+    const events = guardEventsFromDiagnostics(
+      [diagnosticEvent(["event_auth_checked", "blocked", "per_tx_cap_exceeded"])],
+      GUARD,
+    );
+    assert.equal(events[0]!.stream, "diagnostic");
+    assert.equal(events[0]!.source, "diagnostic");
+    assert.equal(events[0]!.observedAt, null);
+  });
 });
 
 describe("describeGuardEvent", () => {
@@ -181,9 +196,11 @@ describe("describeGuardEvent", () => {
       kind: "auth_checked",
       topic: "event_auth_checked",
       source: "ledger",
+      stream: "committed",
       contractId: GUARD,
       ledger: 4674314,
       ledgerClosedAt: null,
+      observedAt: null,
       transactionHash: "ab".repeat(32),
       decision: { result: "allowed", reason: null, source: "ledger" },
       data: {},
@@ -198,9 +215,11 @@ describe("describeGuardEvent", () => {
       kind: "auth_checked",
       topic: "event_auth_checked",
       source: "diagnostic",
+      stream: "diagnostic",
       contractId: GUARD,
       ledger: null,
       ledgerClosedAt: null,
+      observedAt: null,
       transactionHash: null,
       decision: { result: "blocked", reason: "per_tx_cap_exceeded", source: "diagnostic" },
       data: {},
@@ -809,6 +828,210 @@ describe("GuardTelemetryListener abort cancellation (issue #95)", () => {
     assert.equal(outcome, "ended", "abort during the poll delay must end the iterator, not hang");
     assert.equal(getEventsCalls, 1, "the aborted interval must not be followed by another poll");
     assert.deepEqual(sleepDelays, [5_000], "the delay is requested once, then cut short");
+  });
+});
+
+/**
+ * Unified stream (`watchAll` / `mergeGuardEventStreams`, issue #67).
+ *
+ * `watch()` alone is the motivating trap: a blocked decision is rolled back
+ * before broadcast, so a consumer tailing the ledger sees a guard that never
+ * blocks. These tests pin the merged stream both ways — that it really carries
+ * both sources, ordered and de-duplicated, and that the default `watch()` path
+ * is untouched.
+ */
+describe("GuardTelemetryListener unified stream (issue #67)", () => {
+  /** A committed event shaped as `poll()` produces one. */
+  function committedEvent(ledger: number, txHash = "ab".repeat(32)): GuardEvent {
+    return {
+      id: `ledger:${txHash}:event_auth_checked`,
+      kind: "auth_checked",
+      topic: "event_auth_checked",
+      source: "ledger",
+      stream: "committed",
+      contractId: GUARD,
+      ledger,
+      ledgerClosedAt: "2026-09-27T00:00:00Z",
+      observedAt: null,
+      transactionHash: txHash,
+      decision: { result: "allowed", reason: null, source: "ledger" },
+      data: {},
+    };
+  }
+
+  function diagnosticBatch(reason: string, observedAt = "T1"): GuardDiagnosticBatch {
+    return {
+      events: guardEventsFromDiagnostics(
+        [diagnosticEvent(["event_auth_checked", "blocked", reason])],
+        GUARD,
+      ),
+      observedAt,
+    };
+  }
+
+  function deferred(): { promise: Promise<void>; resolve: () => void } {
+    let resolve!: () => void;
+    const promise = new Promise<void>((r) => {
+      resolve = r;
+    });
+    return { promise, resolve };
+  }
+
+  const flush = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+  /** A fake RPC serving one committed page, then aborting the loop. */
+  function onePageServer(ledger = 100) {
+    return {
+      getLatestLedger: async () => ({ sequence: ledger }),
+      getEvents: async () => ({
+        events: [
+          {
+            contractId: GUARD,
+            type: "contract",
+            ledger,
+            ledgerClosedAt: "2026-09-27T00:00:00Z",
+            txHash: "ab".repeat(32),
+            topic: ["event_auth_checked", "allowed", ""].map((topic) => xdr.ScVal.scvSymbol(topic)),
+            value: xdr.ScVal.scvMap([]),
+          },
+        ],
+        cursor: "cursor_1",
+        latestLedger: ledger,
+      }),
+    };
+  }
+
+  it("yields both sources, discriminating and time-tagging them", async () => {
+    const controller = new AbortController();
+    const listener = new GuardTelemetryListener({ server: onePageServer() as never, guard: GUARD });
+    const seen: GuardEvent[] = [];
+
+    for await (const event of listener.watchAll({
+      startLedger: 100,
+      signal: controller.signal,
+      diagnostics: [diagnosticBatch("per_tx_cap_exceeded", "2026-09-27T00:00:01.000Z")],
+      sleep: async () => controller.abort(),
+    })) {
+      seen.push(event);
+    }
+
+    const committed = seen.find((event) => event.stream === "committed");
+    const diagnostic = seen.find((event) => event.stream === "diagnostic");
+
+    assert.ok(committed, "the committed feed must be present");
+    assert.equal(committed.source, "ledger");
+    assert.equal(committed.observedAt, null);
+
+    assert.ok(diagnostic, "the diagnostic feed must be present");
+    assert.equal(diagnostic.source, "diagnostic");
+    assert.equal(diagnostic.observedAt, "2026-09-27T00:00:01.000Z", "diagnostics carry the observation time");
+    assert.equal(diagnostic.decision?.result, "blocked");
+  });
+
+  it("sorts committed events by ledger regardless of page order", async () => {
+    const seen: GuardEvent[] = [];
+    for await (const event of mergeGuardEventStreams([
+      [committedEvent(500, "cc".repeat(32)), committedEvent(100, "dd".repeat(32))],
+    ])) {
+      seen.push(event);
+    }
+    assert.deepEqual(seen.map((event) => event.ledger), [100, 500]);
+  });
+
+  it("interleaves a diagnostic batch at its point of observation", async () => {
+    const page1 = deferred();
+    const page2 = deferred();
+    const diag1 = deferred();
+    const diag2 = deferred();
+
+    async function* committed() {
+      await page1.promise;
+      yield [committedEvent(100, "11".repeat(32))];
+      await page2.promise;
+      yield [committedEvent(101, "22".repeat(32))];
+    }
+
+    async function* diagnostics() {
+      await diag1.promise;
+      yield diagnosticBatch("per_tx_cap_exceeded", "T1");
+      await diag2.promise;
+      yield diagnosticBatch("window_cap_exceeded", "T2");
+    }
+
+    const seen: GuardEvent[] = [];
+    const drain = (async () => {
+      for await (const event of mergeGuardEventStreams(committed(), diagnostics())) {
+        seen.push(event);
+      }
+    })();
+
+    const shape = () => seen.map((event) => event.ledger ?? event.decision?.reason);
+
+    page1.resolve();
+    await flush();
+    assert.deepEqual(shape(), [100]);
+
+    diag1.resolve();
+    await flush();
+    assert.deepEqual(shape(), [100, "per_tx_cap_exceeded"]);
+
+    page2.resolve();
+    await flush();
+    assert.deepEqual(shape(), [100, "per_tx_cap_exceeded", 101]);
+
+    diag2.resolve();
+    await drain;
+    assert.deepEqual(shape(), [100, "per_tx_cap_exceeded", 101, "window_cap_exceeded"]);
+    assert.deepEqual(
+      seen.map((event) => event.stream),
+      ["committed", "diagnostic", "committed", "diagnostic"],
+    );
+  });
+
+  it("de-duplicates by id: a re-fed diagnostic batch is emitted once", async () => {
+    const batch = diagnosticBatch("per_tx_cap_exceeded");
+    const seen: GuardEvent[] = [];
+    for await (const event of mergeGuardEventStreams([], [batch, batch, batch])) {
+      seen.push(event);
+    }
+    assert.equal(seen.length, 1, "identical ids must collapse to one delivery");
+  });
+
+  it("emits every id at most once across both sources", async () => {
+    const duplicate = committedEvent(100, "aa".repeat(32));
+    const seen: GuardEvent[] = [];
+    for await (const event of mergeGuardEventStreams(
+      [[duplicate, { ...duplicate }]],
+      [diagnosticBatch("per_tx_cap_exceeded"), diagnosticBatch("per_tx_cap_exceeded")],
+    )) {
+      seen.push(event);
+    }
+    const ids = seen.map((event) => event.id);
+    assert.equal(new Set(ids).size, ids.length, "no id may be delivered twice");
+    assert.deepEqual(seen.map((event) => event.stream), ["committed", "diagnostic"]);
+  });
+
+  it("leaves the default watch() path committed-only, tagging every event", async () => {
+    const controller = new AbortController();
+    const listener = new GuardTelemetryListener({ server: onePageServer() as never, guard: GUARD });
+    const seen: GuardEvent[] = [];
+
+    for await (const page of listener.watch({
+      startLedger: 100,
+      signal: controller.signal,
+      sleep: async () => controller.abort(),
+    })) {
+      seen.push(...page);
+    }
+
+    assert.ok(seen.length >= 1, "watch() must still yield the committed page");
+    assert.ok(
+      seen.every(
+        (event) =>
+          event.stream === "committed" && event.source === "ledger" && event.observedAt === null,
+      ),
+      "watch() is unchanged: committed events only, with the additive fields defaulted",
+    );
   });
 });
 
