@@ -28,6 +28,7 @@ import { createHash } from "node:crypto";
 import { Keypair, StrKey, rpc, xdr } from "@stellar/stellar-sdk";
 import { GuardError, SimulationError } from "./errors.ts";
 import { enforceCall } from "./invoke.ts";
+import { resourceBreakdownFromSimulation, type ResourceBreakdown } from "./cost.ts";
 import {
   extractTransferAmount,
   fetchGuardPolicyAndWindow,
@@ -186,6 +187,8 @@ export type PreFlightDecision =
       estimatedResourceFee: bigint;
       /** Number of ledger keys the call is priced to touch. */
       footprintKeys: number;
+      /** Resource limits and footprint counts from the same simulation. */
+      resourceBreakdown?: ResourceBreakdown;
     }
   | {
       allowed: false;
@@ -495,6 +498,7 @@ export class PreFlightInterceptor {
         diagnosticEvents: outcome.diagnosticEvents,
       };
     } else {
+      const resourceBreakdown = resourceBreakdownFromSimulation(outcome.simulation);
       const data = outcome.simulation.transactionData as unknown as
         | { getReadOnly?: () => unknown[]; getReadWrite?: () => unknown[] }
         | undefined;
@@ -528,6 +532,7 @@ export class PreFlightInterceptor {
         kind: "admissible",
         estimatedResourceFee,
         footprintKeys,
+        ...(resourceBreakdown ? { resourceBreakdown } : {}),
       };
     }
 

@@ -483,6 +483,26 @@ formatFee(1n);             // "0.0000001" — one stroop
 formatFee(9_999_999n);     // "0.9999999" — largest sub-XLM value
 ```
 
+#### `CostPreChecker` resource breakdown
+
+Priced `within_budget` and `over_budget` results may include a `breakdown` parsed from the same Soroban simulation that produced `resourceFeeStroops`:
+
+```ts
+if (decision.kind === "within_budget" && decision.breakdown) {
+  console.log(decision.breakdown);
+  // {
+  //   instructions,       // SorobanResources.instructions
+  //   diskReadBytes,      // SorobanResources.diskReadBytes
+  //   writeBytes,         // SorobanResources.writeBytes
+  //   readOnlyEntries,    // footprint.readOnly.length
+  //   readWriteEntries,   // footprint.readWrite.length
+  //   storageEntries      // readOnlyEntries + readWriteEntries
+  // }
+}
+```
+
+`breakdown` is `undefined` when the simulation is undetermined, malformed, or missing any required resource field; the SDK never fabricates zero values. The stellar-sdk v17 Soroban resource payload has no `memBytes` field, so this API reports the actual `writeBytes`/disk resource fields rather than relabeling them as memory usage.
+
 #### One simulation per check: prefer `checkWithCost`
 
 `PreFlightInterceptor.check()` answers *may this proceed?* and

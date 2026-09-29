@@ -122,10 +122,12 @@ export {
   formatFee,
   precheckCost,
   precheckCostWithDecision,
+  resourceBreakdownFromSimulation,
   type CostDecision,
   type CostPreCheckConfig,
   type CostWithDecision,
   type FeeBreakdown,
+  type ResourceBreakdown,
 } from "./cost.ts";
 
 export {
